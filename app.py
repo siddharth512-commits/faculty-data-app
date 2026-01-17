@@ -511,7 +511,7 @@ with tab_entry:
     )
 
     patent_type_options = [
-        "Patent Granted",
+        "Indian Design Patent",
         "Utility granted",
         "Utility Published",
         "UK Design Patent",
@@ -535,7 +535,7 @@ with tab_entry:
 
         if st.button("➕ Add Item", key="add_pm"):
             add_item("patents_models", {
-                "item_type": "Patent Granted",
+                "item_type": "Indian Design Patent",
                 "title": "",
                 "item_date": DEFAULT_DATE,
                 "details": "",
@@ -1031,4 +1031,5 @@ with tab_admin:
     st.subheader("Preview Data")
     table_to_preview = st.selectbox("Select table to preview", table_names)
     st.dataframe(dfs[table_to_preview], use_container_width=True)
+
 
