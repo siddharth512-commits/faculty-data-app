@@ -286,7 +286,7 @@ with tab_entry:
     ensure_list_state("books", {"item_type": "Book", "title": "", "publisher": "", "pub_date": DEFAULT_DATE, "pdf": None})
 
     ensure_list_state("patents_models", {
-        "item_type": "Patent Granted",
+        "item_type": "Indian design Patent",
         "title": "",
         "item_date": DEFAULT_DATE,
         "details": "",
@@ -1031,3 +1031,4 @@ with tab_admin:
     st.subheader("Preview Data")
     table_to_preview = st.selectbox("Select table to preview", table_names)
     st.dataframe(dfs[table_to_preview], use_container_width=True)
+
