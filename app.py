@@ -60,7 +60,7 @@ def init_db():
     )
     """)
 
-    # FDP/STTP/etc (will be migrated via ensure_column if DB already exists)
+    # FDP/STTP/etc
     cur.execute("""
     CREATE TABLE IF NOT EXISTS fdp_sttp (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,12 +139,12 @@ def init_db():
     )
     """)
 
-    # Patents / Working models / Prototypes (last 3 years)
+    # Patents / Working models / Prototypes
     cur.execute("""
     CREATE TABLE IF NOT EXISTS patents_models (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         faculty_id TEXT NOT NULL,
-        item_type TEXT NOT NULL,          -- Patent Granted / Working Model / Prototype
+        item_type TEXT NOT NULL,          -- Patent/Model categories
         title TEXT NOT NULL,
         item_date TEXT NOT NULL,          -- ISO date string
         details TEXT,
@@ -153,9 +153,29 @@ def init_db():
     )
     """)
 
-    # Sponsored projects (CAY removed; date used)
+    # Sponsored projects
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sponsored_projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        faculty_id TEXT NOT NULL,
+        project_date TEXT,                -- ISO date string
+        pi_name TEXT NOT NULL,
+        co_pi TEXT,
+        dept_sanctioned TEXT NOT NULL,
+        project_title TEXT NOT NULL,
+        funding_agency TEXT NOT NULL,
+        duration TEXT NOT NULL,
+        amount_lakhs REAL NOT NULL,
+        status TEXT NOT NULL,             -- Ongoing/Completed
+        sanction_pdf_path TEXT,           -- uploaded file path
+        completion_pdf_path TEXT,         -- uploaded file path
+        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
+    )
+    """)
+
+    # NEW: Consultancy Work (same structure as sponsored projects)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS consultancy_work (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         faculty_id TEXT NOT NULL,
         project_date TEXT,                -- ISO date string
@@ -179,6 +199,7 @@ def init_db():
     ensure_column(conn, "fdp_sttp", "program_type", "TEXT")
     ensure_column(conn, "fdp_sttp", "program_name", "TEXT")
     ensure_column(conn, "sponsored_projects", "project_date", "TEXT")
+    ensure_column(conn, "consultancy_work", "project_date", "TEXT")
 
     conn.close()
 
@@ -206,10 +227,9 @@ def fetch_table_df(table_name: str) -> pd.DataFrame:
 
 def make_excel_bytes(dfs: dict) -> bytes:
     buffer = BytesIO()
-    # openpyxl is optional; call only if installed
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for sheet, df in dfs.items():
-            safe_sheet = sheet[:31]  # Excel sheet name limit
+            safe_sheet = sheet[:31]
             df.to_excel(writer, sheet_name=safe_sheet, index=False)
     buffer.seek(0)
     return buffer.getvalue()
@@ -249,7 +269,6 @@ with tab_entry:
     # Repeatable sections
     ensure_list_state("memberships", {"body_name": "", "membership_number": "", "level": "National", "grade_position": ""})
 
-    # FDP/STTP tweak: type + name added
     ensure_list_state("fdps", {
         "program_type": "FDP",
         "program_name": "",
@@ -263,11 +282,9 @@ with tab_entry:
     ensure_list_state("student_support", {"project_name": "", "event_date": "", "place": "", "website_link": ""})
     ensure_list_state("industry", {"activity_name": "", "company_place": "", "duration": "", "outcomes": ""})
 
-    # Academic Research
     ensure_list_state("pubs_jc", {"pub_type": "Journal", "title": "", "doi": "", "pub_date": DEFAULT_DATE, "pdf": None})
     ensure_list_state("books", {"item_type": "Book", "title": "", "publisher": "", "pub_date": DEFAULT_DATE, "pdf": None})
 
-    # NEW: patents/models/prototypes (shown only if user says Yes)
     ensure_list_state("patents_models", {
         "item_type": "Patent Granted",
         "title": "",
@@ -276,8 +293,17 @@ with tab_entry:
         "pdf": None
     })
 
-    # Sponsored projects
     ensure_list_state("sponsored", {
+        "project_date": DEFAULT_DATE,
+        "pi_name": "", "co_pi": "",
+        "dept_sanctioned": "",
+        "project_title": "", "funding_agency": "", "duration": "", "amount_lakhs": 0.0,
+        "status": "Ongoing",
+        "sanction_pdf": None, "completion_pdf": None
+    })
+
+    # NEW: Consultancy Work state (same fields as sponsored)
+    ensure_list_state("consultancy", {
         "project_date": DEFAULT_DATE,
         "pi_name": "", "co_pi": "",
         "dept_sanctioned": "",
@@ -318,7 +344,7 @@ with tab_entry:
 
     st.divider()
 
-    # 3. FDP/STTP Resource person (UPDATED)
+    # 3. FDP/STTP Resource person
     st.subheader("3. As resource person in FDP/STTP")
     has_fdp = st.radio("Resource person entries (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_fdp")
 
@@ -475,24 +501,29 @@ with tab_entry:
 
     st.divider()
 
-    # 7C. Patents / Working Models / Prototypes (NEW)
+    # 7C. Patents / Working Models / Prototypes
     st.markdown("### 7C. Patents / Working Models / Prototypes (last 3 years)")
     has_patents = st.radio(
-        "Do you have patents granted / working models / prototypes developed in the last 3 years? *",
+        "Do you have patents granted / published / design patents / working models / prototypes in the last 3 years? *",
         ["No", "Yes"],
         horizontal=True,
         key="has_patents"
     )
 
+    patent_type_options = [
+        "Patent Granted",
+        "Utility granted",
+        "Utility Published",
+        "UK Design Patent",
+        "Working Model",
+        "Prototype",
+    ]
+
     if has_patents == "Yes":
         st.caption("Add one row per item. PDF upload is optional (proof/document).")
         for i, pm in enumerate(st.session_state["patents_models"]):
-            cols = st.columns([2.2, 3.6, 2.2, 3.2, 2.2, 1])
-            pm["item_type"] = cols[0].selectbox(
-                "Type *",
-                ["Patent Granted", "Working Model", "Prototype"],
-                key=f"pm_type_{i}"
-            )
+            cols = st.columns([2.3, 3.6, 2.2, 3.2, 2.2, 1])
+            pm["item_type"] = cols[0].selectbox("Type *", patent_type_options, key=f"pm_type_{i}")
             pm["title"] = cols[1].text_input("Title / Name *", value=pm["title"], key=f"pm_title_{i}")
             pm["item_date"] = cols[2].date_input("Date *", value=pm["item_date"], key=f"pm_date_{i}")
             pm["details"] = cols[3].text_input("Details (optional)", value=pm["details"], key=f"pm_details_{i}")
@@ -523,14 +554,11 @@ with tab_entry:
         sp["project_date"] = cols1[0].date_input("Project date *", value=sp["project_date"], key=f"sp_date_{i}")
         sp["pi_name"] = cols1[1].text_input("PI Name *", value=sp["pi_name"], key=f"sp_pi_{i}")
         sp["co_pi"] = cols1[2].text_input("Co-PI (if any)", value=sp["co_pi"], key=f"sp_copi_{i}")
-
-        # Renamed label (DB column stays dept_sanctioned)
         sp["dept_sanctioned"] = cols1[3].text_input(
             "Name of Dept., where project is sanctioned *",
             value=sp["dept_sanctioned"],
             key=f"sp_dept_{i}"
         )
-
         sp["status"] = cols1[4].selectbox("Status *", ["Ongoing", "Completed"], key=f"sp_status_{i}")
         if cols1[5].button("➖", key=f"sp_rm_{i}"):
             remove_item("sponsored", i)
@@ -571,6 +599,63 @@ with tab_entry:
         key="proj_confirm"
     )
 
+    st.divider()
+
+    # 9. Consultancy Work (NEW)
+    st.subheader("9. Consultancy Work")
+    st.caption("Add one row per consultancy work item. Upload supporting PDFs if applicable.")
+
+    for i, cw in enumerate(st.session_state["consultancy"]):
+        cols1 = st.columns([2.0, 2.2, 2.2, 2.4, 1.2, 1])
+        cw["project_date"] = cols1[0].date_input("Consultancy date *", value=cw["project_date"], key=f"cw_date_{i}")
+        cw["pi_name"] = cols1[1].text_input("PI Name *", value=cw["pi_name"], key=f"cw_pi_{i}")
+        cw["co_pi"] = cols1[2].text_input("Co-PI (if any)", value=cw["co_pi"], key=f"cw_copi_{i}")
+        cw["dept_sanctioned"] = cols1[3].text_input(
+            "Name of Dept., where project is sanctioned *",
+            value=cw["dept_sanctioned"],
+            key=f"cw_dept_{i}"
+        )
+        cw["status"] = cols1[4].selectbox("Status *", ["Ongoing", "Completed"], key=f"cw_status_{i}")
+        if cols1[5].button("➖", key=f"cw_rm_{i}"):
+            remove_item("consultancy", i)
+            st.rerun()
+
+        cols2 = st.columns([3, 2, 2, 2])
+        cw["project_title"] = cols2[0].text_input("Project title *", value=cw["project_title"], key=f"cw_title_{i}")
+        cw["funding_agency"] = cols2[1].text_input("Funding agency / Client *", value=cw["funding_agency"], key=f"cw_ag_{i}")
+        cw["duration"] = cols2[2].text_input("Duration *", value=cw["duration"], key=f"cw_dur_{i}")
+        cw["amount_lakhs"] = cols2[3].number_input(
+            "Amount (Lakhs) *",
+            min_value=0.0,
+            step=0.5,
+            value=float(cw["amount_lakhs"]),
+            key=f"cw_amt_{i}"
+        )
+
+        cols3 = st.columns([3, 3])
+        cw["sanction_pdf"] = cols3[0].file_uploader("Upload Approval/Work Order (PDF) (optional)", type=["pdf"], key=f"cw_san_{i}")
+        cw["completion_pdf"] = cols3[1].file_uploader("Upload Completion/Report (PDF) (optional)", type=["pdf"], key=f"cw_comp_{i}")
+
+        st.markdown("---")
+
+    if st.button("➕ Add Consultancy Work", key="add_cw"):
+        add_item("consultancy", {
+            "project_date": DEFAULT_DATE,
+            "pi_name": "", "co_pi": "",
+            "dept_sanctioned": "",
+            "project_title": "", "funding_agency": "", "duration": "", "amount_lakhs": 0.0,
+            "status": "Ongoing",
+            "sanction_pdf": None, "completion_pdf": None
+        })
+        st.rerun()
+
+    consult_confirm = st.checkbox(
+        "I confirm the uploaded documents (if any) correspond to the consultancy items listed above.",
+        value=False,
+        key="consult_confirm"
+    )
+
+    # Submit button
     submitted = st.button("✅ Submit", key="submit_btn")
 
     # ----------------------------
@@ -584,15 +669,17 @@ with tab_entry:
         if not pub_confirm:
             errors.append("Please confirm Journal/Conference publication PDFs matching.")
         if not proj_confirm:
-            errors.append("Please confirm project documents matching.")
+            errors.append("Please confirm sponsored project documents matching.")
+        if not consult_confirm:
+            errors.append("Please confirm consultancy documents matching.")
 
-        # Membership required fields
+        # Membership
         if has_membership == "Yes":
             for idx, m in enumerate(st.session_state["memberships"], start=1):
                 if not all([m["body_name"].strip(), m["membership_number"].strip(), m["level"].strip(), m["grade_position"].strip()]):
                     errors.append(f"Membership #{idx}: all fields are required.")
 
-        # FDP/STTP/etc required fields (UPDATED)
+        # FDP/STTP/etc
         if has_fdp == "Yes":
             for idx, f in enumerate(st.session_state["fdps"], start=1):
                 if not all([
@@ -623,7 +710,7 @@ with tab_entry:
                 if not all([a["activity_name"].strip(), a["company_place"].strip(), a["duration"].strip(), a["outcomes"].strip()]):
                     errors.append(f"Industry entry #{idx}: all fields are required.")
 
-        # Publications: Journal/Conference required
+        # Publications (required)
         for idx, p in enumerate(st.session_state["pubs_jc"], start=1):
             if not p["pub_type"].strip() or not p["title"].strip() or not p["doi"].strip():
                 errors.append(f"Publication #{idx}: Type, Title, and DOI are required.")
@@ -653,6 +740,19 @@ with tab_entry:
             if sp.get("sanction_pdf") is None:
                 errors.append(f"Sponsored project #{idx}: sanction/approval PDF is required.")
 
+        # Consultancy: same required text fields; PDFs optional
+        for idx, cw in enumerate(st.session_state["consultancy"], start=1):
+            req_fields = [
+                (cw.get("pi_name") or ""),
+                (cw.get("dept_sanctioned") or ""),
+                (cw.get("project_title") or ""),
+                (cw.get("funding_agency") or ""),
+                (cw.get("duration") or ""),
+                (cw.get("status") or "")
+            ]
+            if not all([str(x).strip() for x in req_fields]) or cw.get("project_date") is None:
+                errors.append(f"Consultancy work #{idx}: Date + required fields are mandatory.")
+
         if errors:
             st.error("Please fix the following issues:\n\n- " + "\n- ".join(errors))
         else:
@@ -681,7 +781,7 @@ with tab_entry:
                         m["grade_position"].strip()
                     ))
 
-            # FDP/STTP/etc (UPDATED)
+            # FDP/STTP/etc
             if has_fdp == "Yes":
                 for f in st.session_state["fdps"]:
                     cur.execute("""
@@ -815,6 +915,33 @@ with tab_entry:
                     completion_path
                 ))
 
+            # Consultancy work + PDFs (PDFs optional)
+            for cw in st.session_state["consultancy"]:
+                sanction_path = save_uploaded_file(cw.get("sanction_pdf"), f"consultancy/{faculty_id}/approval") if cw.get("sanction_pdf") else None
+                completion_path = save_uploaded_file(cw.get("completion_pdf"), f"consultancy/{faculty_id}/completion") if cw.get("completion_pdf") else None
+                project_date_str = cw["project_date"].isoformat() if cw.get("project_date") else ""
+
+                cur.execute("""
+                    INSERT INTO consultancy_work (
+                        faculty_id, project_date, pi_name, co_pi, dept_sanctioned, project_title,
+                        funding_agency, duration, amount_lakhs, status,
+                        sanction_pdf_path, completion_pdf_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    faculty_id,
+                    project_date_str,
+                    (cw.get("pi_name") or "").strip(),
+                    (cw.get("co_pi") or "").strip(),
+                    (cw.get("dept_sanctioned") or "").strip(),
+                    (cw.get("project_title") or "").strip(),
+                    (cw.get("funding_agency") or "").strip(),
+                    (cw.get("duration") or "").strip(),
+                    float(cw.get("amount_lakhs") or 0.0),
+                    (cw.get("status") or "").strip(),
+                    sanction_path,
+                    completion_path
+                ))
+
             conn.commit()
             conn.close()
 
@@ -828,13 +955,16 @@ with tab_entry:
 with tab_admin:
     st.title("Admin Downloads")
 
-    # Optional password gate:
+    # Password gate (MUST be set via Streamlit Secrets on cloud)
     admin_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
-    if admin_pw:
-        entered = st.text_input("Enter Admin Password", type="password")
-        if entered != admin_pw:
-            st.warning("Enter the correct admin password to access downloads.")
-            st.stop()
+    if not admin_pw:
+        st.error("Admin access is not configured. Set ADMIN_PASSWORD in Streamlit Secrets.")
+        st.stop()
+
+    entered = st.text_input("Enter Admin Password", type="password")
+    if entered != admin_pw:
+        st.warning("Enter the correct admin password to access downloads.")
+        st.stop()
 
     st.caption("Download all submissions as Excel (multi-sheet) or individual CSV files.")
 
@@ -849,6 +979,7 @@ with tab_admin:
         "books_chapters",
         "patents_models",
         "sponsored_projects",
+        "consultancy_work",
     ]
 
     dfs = {}
@@ -859,16 +990,16 @@ with tab_admin:
             dfs[t] = pd.DataFrame()
 
     st.subheader("Quick Summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Faculty records", len(dfs["faculty"]))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Faculty", len(dfs["faculty"]))
     c2.metric("Publications (J/C)", len(dfs["publications_jc"]))
-    c3.metric("Patents/Models/Prototypes", len(dfs["patents_models"]))
+    c3.metric("Patents/Models", len(dfs["patents_models"]))
     c4.metric("Sponsored projects", len(dfs["sponsored_projects"]))
+    c5.metric("Consultancy", len(dfs["consultancy_work"]))
 
     st.divider()
 
     st.subheader("Download All Data")
-    # Clean UI: Excel is optional; if openpyxl missing, no crash / no traceback.
     try:
         import openpyxl  # noqa: F401
         excel_bytes = make_excel_bytes(dfs)
