@@ -1,249 +1,149 @@
 import os
 import uuid
-import sqlite3
 from datetime import datetime, date
 from io import BytesIO
+from typing import Dict, List, Any, Optional
 
 import pandas as pd
 import streamlit as st
 
+# Google
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
+
 # ----------------------------
 # Config
 # ----------------------------
-DB_PATH = "faculty_data.db"
-UPLOAD_DIR = "uploads"
 DEFAULT_DATE = date.today()
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 st.set_page_config(page_title="Faculty Data Collection", layout="wide")
 
 
 # ----------------------------
-# DB helpers
+# Secrets / Settings
 # ----------------------------
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    if column not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-        conn.commit()
-
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # Core
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS faculty (
-        faculty_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        designation TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS membership (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        body_name TEXT NOT NULL,
-        membership_number TEXT NOT NULL,
-        level TEXT NOT NULL,
-        grade_position TEXT NOT NULL,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    # FDP/STTP/etc
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS fdp_sttp (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        program_type TEXT,
-        program_name TEXT,
-        involvement TEXT NOT NULL,
-        date TEXT NOT NULL,
-        location TEXT NOT NULL,
-        organised_by TEXT NOT NULL,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS courses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        date TEXT NOT NULL,
-        course_name TEXT NOT NULL,
-        offered_by TEXT NOT NULL,
-        grade TEXT NOT NULL,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS student_projects_support (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        project_name TEXT NOT NULL,
-        event_date TEXT NOT NULL,
-        place TEXT NOT NULL,
-        website_link TEXT,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS industry_collab (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        activity_name TEXT NOT NULL,
-        company_place TEXT NOT NULL,
-        duration TEXT NOT NULL,
-        outcomes TEXT NOT NULL,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    # Academic Research: Journal + Conference
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS publications_jc (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        pub_type TEXT NOT NULL,           -- Journal / Conference
-        title TEXT NOT NULL,
-        doi TEXT NOT NULL,
-        pub_date TEXT NOT NULL,           -- ISO date YYYY-MM-DD
-        pdf_path TEXT NOT NULL,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    # Books / Chapters
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS books_chapters (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        item_type TEXT NOT NULL,          -- Book / Book Chapter
-        title TEXT NOT NULL,
-        publisher TEXT,
-        pub_date TEXT,
-        pdf_path TEXT,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    # Patents / Working models / Prototypes
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS patents_models (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        item_type TEXT NOT NULL,          -- dropdown categories
-        title TEXT NOT NULL,
-        item_date TEXT NOT NULL,          -- ISO date YYYY-MM-DD
-        details TEXT,
-        pdf_path TEXT,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    # Sponsored Projects
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS sponsored_projects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        project_date TEXT,
-        pi_name TEXT NOT NULL,
-        co_pi TEXT,
-        dept_sanctioned TEXT NOT NULL,
-        project_title TEXT NOT NULL,
-        funding_agency TEXT NOT NULL,
-        duration TEXT NOT NULL,
-        amount_lakhs REAL NOT NULL,
-        status TEXT NOT NULL,
-        sanction_pdf_path TEXT,
-        completion_pdf_path TEXT,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    # Consultancy Work (same structure)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS consultancy_work (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        faculty_id TEXT NOT NULL,
-        project_date TEXT,
-        pi_name TEXT NOT NULL,
-        co_pi TEXT,
-        dept_sanctioned TEXT NOT NULL,
-        project_title TEXT NOT NULL,
-        funding_agency TEXT NOT NULL,
-        duration TEXT NOT NULL,
-        amount_lakhs REAL NOT NULL,
-        status TEXT NOT NULL,
-        sanction_pdf_path TEXT,
-        completion_pdf_path TEXT,
-        FOREIGN KEY(faculty_id) REFERENCES faculty(faculty_id)
-    )
-    """)
-
-    conn.commit()
-
-    # Migrations for older DBs
-    ensure_column(conn, "fdp_sttp", "program_type", "TEXT")
-    ensure_column(conn, "fdp_sttp", "program_name", "TEXT")
-    ensure_column(conn, "sponsored_projects", "project_date", "TEXT")
-    ensure_column(conn, "consultancy_work", "project_date", "TEXT")
-
-    conn.close()
-
-
-def _safe_ext(filename: str) -> str:
-    ext = os.path.splitext(filename)[-1].lower()
-    return ext if ext else ".pdf"
-
-
-def save_uploaded_bytes(file_dict, subdir):
+def get_secret(path: str, default=None):
     """
-    file_dict: {"name": "...", "bytes": b"..."} or None
+    path like: "google.sheet_id"
     """
-    if not file_dict:
-        return None
-    os.makedirs(os.path.join(UPLOAD_DIR, subdir), exist_ok=True)
-    ext = _safe_ext(file_dict.get("name", "file.pdf"))
-    fname = f"{uuid.uuid4().hex}{ext}"
-    path = os.path.join(UPLOAD_DIR, subdir, fname)
-    with open(path, "wb") as f:
-        f.write(file_dict["bytes"])
-    return path
+    cur = st.secrets
+    for part in path.split("."):
+        if part not in cur:
+            return default
+        cur = cur[part]
+    return cur
 
 
-def fetch_table_df(table_name: str) -> pd.DataFrame:
-    conn = get_conn()
+GOOGLE_SA_INFO = get_secret("google.service_account", None)  # dict
+SHEET_ID = get_secret("google.sheet_id", "")
+DRIVE_FOLDER_ID = get_secret("google.drive_folder_id", "")
+ADMIN_PASSWORD = get_secret("app.admin_password", "")
+ADMIN_EMAIL = get_secret("app.admin_email", "")  # optional
+
+
+# ----------------------------
+# Google Clients
+# ----------------------------
+@st.cache_resource
+def get_google_clients():
+    if not GOOGLE_SA_INFO or not SHEET_ID or not DRIVE_FOLDER_ID:
+        raise RuntimeError(
+            "Missing secrets. You must set google.service_account, google.sheet_id, google.drive_folder_id in Streamlit secrets."
+        )
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(GOOGLE_SA_INFO, scopes=scopes)
+
+    gs_client = gspread.authorize(creds)
+    drive_service = build("drive", "v3", credentials=creds)
+
+    sh = gs_client.open_by_key(SHEET_ID)
+    return sh, drive_service
+
+
+def ensure_worksheet(sh, title: str, headers: List[str]):
+    """
+    Ensure a worksheet exists and has the header row.
+    """
     try:
-        df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
-    finally:
-        conn.close()
-    return df
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=2000, cols=max(10, len(headers) + 2))
+        ws.append_row(headers)
+
+    # Ensure header exists (if sheet existed but blank)
+    try:
+        first_row = ws.row_values(1)
+    except Exception:
+        first_row = []
+    if not first_row or first_row != headers:
+        # If empty or mismatched, write headers in row 1
+        ws.resize(rows=max(ws.row_count, 2), cols=max(ws.col_count, len(headers)))
+        ws.update("A1", [headers])
+    return ws
 
 
-def make_excel_bytes(dfs: dict) -> bytes:
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        for sheet, df in dfs.items():
-            df.to_excel(writer, sheet_name=sheet[:31], index=False)
-    buffer.seek(0)
-    return buffer.getvalue()
+def upload_pdf_to_drive(
+    drive_service,
+    file_dict: Dict[str, Any],
+    folder_id: str,
+    name_prefix: str,
+    share_to_email: str = "",
+) -> Dict[str, str]:
+    """
+    Uploads bytes to Google Drive folder and returns {"file_id":..., "web_view_link":..., "name":...}
+    - By default files remain private to service account.
+    - If share_to_email provided, grant reader permission to that email.
+    """
+    filename = file_dict.get("name", "file.pdf")
+    data = file_dict.get("bytes", b"")
+    safe_name = f"{name_prefix}_{filename}"
+
+    media = MediaInMemoryUpload(data, mimetype="application/pdf", resumable=False)
+
+    metadata = {
+        "name": safe_name,
+        "parents": [folder_id],
+    }
+
+    created = drive_service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, webViewLink, name",
+    ).execute()
+
+    file_id = created["id"]
+
+    # Optional: share to admin email so you can open links easily
+    if share_to_email:
+        try:
+            drive_service.permissions().create(
+                fileId=file_id,
+                body={
+                    "type": "user",
+                    "role": "reader",
+                    "emailAddress": share_to_email,
+                },
+                sendNotificationEmail=False,
+            ).execute()
+        except Exception:
+            # Don't break submission if sharing fails
+            pass
+
+    return {
+        "file_id": file_id,
+        "web_view_link": created.get("webViewLink", ""),
+        "name": created.get("name", safe_name),
+    }
 
 
 # ----------------------------
-# Streamlit state helpers
+# Streamlit helpers
 # ----------------------------
 def new_row_id() -> str:
     return uuid.uuid4().hex[:10]
@@ -278,7 +178,6 @@ def persist_pdf_uploader(label: str, widget_key: str):
 
     stored = st.session_state.get(store_key)
 
-    # Show stored indicator + clear
     if stored is not None and uploaded is None:
         colA, colB = st.columns([5, 1])
         colA.caption(f"✅ Already uploaded: {stored['name']}")
@@ -363,20 +262,93 @@ def consultancy_factory():
 
 
 # ----------------------------
-# UI
+# Sheet Schema (Worksheets + headers)
 # ----------------------------
-init_db()
+SHEETS = {
+    "faculty": [
+        "submission_id", "submitted_at",
+        "faculty_name", "designation",
+        "has_membership", "has_fdp", "has_courses", "has_support", "has_industry",
+        "has_academic", "has_books", "has_patents",
+        "has_sponsored", "has_consultancy",
+    ],
+    "membership": [
+        "submission_id",
+        "body_name", "membership_number", "level", "grade_position"
+    ],
+    "fdp_sttp": [
+        "submission_id",
+        "program_type", "program_name",
+        "involvement", "date", "location", "organised_by"
+    ],
+    "courses": [
+        "submission_id",
+        "date", "course_name", "offered_by", "grade"
+    ],
+    "student_support": [
+        "submission_id",
+        "project_name", "event_date", "place", "website_link"
+    ],
+    "industry": [
+        "submission_id",
+        "activity_name", "company_place", "duration", "outcomes"
+    ],
+    "publications_jc": [
+        "submission_id",
+        "pub_type", "title", "doi", "pub_date",
+        "pdf_name", "pdf_file_id", "pdf_link"
+    ],
+    "books_chapters": [
+        "submission_id",
+        "item_type", "title", "publisher", "pub_date",
+        "pdf_name", "pdf_file_id", "pdf_link"
+    ],
+    "patents_models": [
+        "submission_id",
+        "item_type", "title", "item_date", "details",
+        "pdf_name", "pdf_file_id", "pdf_link"
+    ],
+    "sponsored_projects": [
+        "submission_id",
+        "project_date", "pi_name", "co_pi",
+        "dept_sanctioned", "project_title", "funding_agency",
+        "duration", "amount_lakhs", "status",
+        "sanction_pdf_name", "sanction_pdf_file_id", "sanction_pdf_link",
+        "completion_pdf_name", "completion_pdf_file_id", "completion_pdf_link"
+    ],
+    "consultancy_work": [
+        "submission_id",
+        "project_date", "pi_name", "co_pi",
+        "dept_sanctioned", "project_title", "funding_agency",
+        "duration", "amount_lakhs", "status",
+        "approval_pdf_name", "approval_pdf_file_id", "approval_pdf_link",
+        "completion_pdf_name", "completion_pdf_file_id", "completion_pdf_link"
+    ],
+}
 
+
+def make_excel_bytes(dfs: dict) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for sheet, df in dfs.items():
+            df.to_excel(writer, sheet_name=sheet[:31], index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ----------------------------
+# App UI
+# ----------------------------
 tab_entry, tab_admin = st.tabs(["📝 Data Entry", "🔐 Admin"])
 
 # ============================
 # TAB 1: DATA ENTRY
 # ============================
 with tab_entry:
-    st.title("Faculty Data Collection Web App")
-    st.info("Repeatable sections support ➕ Add buttons. PDFs will NOT disappear on validation errors now.")
+    st.title("Faculty Data Collection (Google Sheets + Google Drive)")
+    st.info("All submissions are saved permanently to Google Sheets and PDFs to Google Drive (no loss after sleep).")
 
-    # Initialize repeatables with stable IDs
+    # Initialize repeatables
     ensure_list_state("memberships", membership_factory)
     ensure_list_state("fdps", fdp_factory)
     ensure_list_state("courses", course_factory)
@@ -388,28 +360,24 @@ with tab_entry:
     ensure_list_state("sponsored", sponsored_factory)
     ensure_list_state("consultancy", consultancy_factory)
 
-    # 1. Basic Details
+    # 1 Basic
     st.subheader("1. Basic Details")
     name = st.text_input("Name of the Faculty *", key="faculty_name")
     designation = st.selectbox("Designation *", ["AP", "Associate Professor", "Professor"], key="designation")
     st.divider()
 
-    # 2. Professional Membership
+    # 2 Membership
     st.subheader("2. Professional Membership")
     has_membership = st.radio("Professional Membership (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_membership")
 
     if has_membership == "Yes":
-        st.caption("Use ➕ Add Membership to enter multiple memberships neatly.")
         for m in st.session_state["memberships"]:
             rid = m["_id"]
             cols = st.columns([3, 3, 2, 3, 1])
             m["body_name"] = cols[0].text_input("Body Name *", value=m["body_name"], key=f"m_body_{rid}")
             m["membership_number"] = cols[1].text_input("Membership Number *", value=m["membership_number"], key=f"m_no_{rid}")
-            m["level"] = cols[2].selectbox(
-                "Level *", ["National", "International"],
-                index=0 if m["level"] == "National" else 1,
-                key=f"m_lvl_{rid}"
-            )
+            m["level"] = cols[2].selectbox("Level *", ["National", "International"],
+                                           index=0 if m["level"] == "National" else 1, key=f"m_lvl_{rid}")
             m["grade_position"] = cols[3].text_input("Level/Grade/Position *", value=m["grade_position"], key=f"m_pos_{rid}")
             if cols[4].button("➖", key=f"m_rm_{rid}"):
                 remove_row_by_id("memberships", rid)
@@ -421,24 +389,16 @@ with tab_entry:
 
     st.divider()
 
-    # 3. FDP/STTP Resource person
+    # 3 FDP/STTP
     st.subheader("3. As resource person in FDP/STTP")
     has_fdp = st.radio("Resource person entries (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_fdp")
 
     if has_fdp == "Yes":
-        st.caption("Select type first, then fill the details. Add multiple entries if required.")
         for f in st.session_state["fdps"]:
             rid = f["_id"]
             cols0 = st.columns([2.2, 3.8, 1])
-            f["program_type"] = cols0[0].selectbox(
-                "Select Type *", ["FDP", "STTP", "SWAYAM", "NPTEL", "MOOCs"],
-                key=f"f_type_{rid}"
-            )
-            f["program_name"] = cols0[1].text_input(
-                f"Name of {f['program_type']} *",
-                value=f["program_name"],
-                key=f"f_name_{rid}"
-            )
+            f["program_type"] = cols0[0].selectbox("Select Type *", ["FDP", "STTP", "SWAYAM", "NPTEL", "MOOCs"], key=f"f_type_{rid}")
+            f["program_name"] = cols0[1].text_input(f"Name of {f['program_type']} *", value=f["program_name"], key=f"f_name_{rid}")
             if cols0[2].button("➖", key=f"f_rm_{rid}"):
                 remove_row_by_id("fdps", rid)
                 st.rerun()
@@ -456,7 +416,7 @@ with tab_entry:
 
     st.divider()
 
-    # 4. Courses Passed
+    # 4 Courses
     st.subheader("4. Courses Passed")
     has_courses = st.radio("Courses Passed (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_courses")
 
@@ -478,7 +438,7 @@ with tab_entry:
 
     st.divider()
 
-    # 5. Student Innovative Projects Support
+    # 5 Student support
     st.subheader("5. Faculty Support in Student Innovative Projects")
     has_support = st.radio("Support Provided (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_support")
 
@@ -500,7 +460,7 @@ with tab_entry:
 
     st.divider()
 
-    # 6. Industry internship/training/collab
+    # 6 Industry
     st.subheader("6. Faculty Internship/Training/Collaboration with Industry")
     has_industry = st.radio("Industry entries (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_industry")
 
@@ -522,10 +482,11 @@ with tab_entry:
 
     st.divider()
 
-    # 7. Academic Research (YES/NO)
+    # 7 Academic (Yes/No)
     st.subheader("7. Academic Research")
     has_academic = st.radio("Academic Research entries (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_academic")
 
+    pub_confirm = True
     if has_academic == "Yes":
         st.markdown("### 7A. Journal & Conference Publications (multiple entries)")
         for p in st.session_state["pubs_jc"]:
@@ -552,12 +513,10 @@ with tab_entry:
             value=False,
             key="pub_confirm"
         )
-    else:
-        pub_confirm = True
 
     st.divider()
 
-    # 7B Books / Chapters (YES/NO)
+    # 7B Books (Yes/No)
     st.markdown("### 7B. Books / Book Chapters")
     has_books = st.radio("Books / Book Chapters entries (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_books")
 
@@ -580,17 +539,14 @@ with tab_entry:
         if st.button("➕ Add Book / Book Chapter", key="add_book"):
             add_row("books", book_factory)
             st.rerun()
-    # if No, nothing to fill (no confirm needed)
 
     st.divider()
 
-    # 7C. Patents / Working Models / Prototypes
+    # 7C Patents
     st.markdown("### 7C. Patents / Working Models / Prototypes (last 3 years)")
     has_patents = st.radio(
         "Do you have patents / working models / prototypes in the last 3 years? *",
-        ["No", "Yes"],
-        horizontal=True,
-        key="has_patents"
+        ["No", "Yes"], horizontal=True, key="has_patents"
     )
 
     patent_type_options = [
@@ -624,10 +580,11 @@ with tab_entry:
 
     st.divider()
 
-    # 8. Sponsored Projects (Yes/No)
+    # 8 Sponsored
     st.subheader("8. Sponsored research projects received from external agencies")
     has_sponsored = st.radio("Sponsored projects (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_sponsored")
 
+    proj_confirm = True
     if has_sponsored == "Yes":
         for sp in st.session_state["sponsored"]:
             rid = sp["_id"]
@@ -635,7 +592,8 @@ with tab_entry:
             sp["project_date"] = cols1[0].date_input("Project date *", value=sp["project_date"], key=f"sp_date_{rid}")
             sp["pi_name"] = cols1[1].text_input("PI Name *", value=sp["pi_name"], key=f"sp_pi_{rid}")
             sp["co_pi"] = cols1[2].text_input("Co-PI (if any)", value=sp["co_pi"], key=f"sp_copi_{rid}")
-            sp["dept_sanctioned"] = cols1[3].text_input("Name of Dept., where project is sanctioned *", value=sp["dept_sanctioned"], key=f"sp_dept_{rid}")
+            sp["dept_sanctioned"] = cols1[3].text_input("Name of Dept., where project is sanctioned *",
+                                                        value=sp["dept_sanctioned"], key=f"sp_dept_{rid}")
             sp["status"] = cols1[4].selectbox("Status *", ["Ongoing", "Completed"], key=f"sp_status_{rid}")
 
             if cols1[5].button("➖", key=f"sp_rm_{rid}"):
@@ -648,7 +606,8 @@ with tab_entry:
             sp["project_title"] = cols2[0].text_input("Project title *", value=sp["project_title"], key=f"sp_title_{rid}")
             sp["funding_agency"] = cols2[1].text_input("Funding agency *", value=sp["funding_agency"], key=f"sp_ag_{rid}")
             sp["duration"] = cols2[2].text_input("Duration *", value=sp["duration"], key=f"sp_dur_{rid}")
-            sp["amount_lakhs"] = cols2[3].number_input("Amount (Lakhs) *", min_value=0.0, step=0.5, value=float(sp["amount_lakhs"]), key=f"sp_amt_{rid}")
+            sp["amount_lakhs"] = cols2[3].number_input("Amount (Lakhs) *", min_value=0.0, step=0.5,
+                                                       value=float(sp["amount_lakhs"]), key=f"sp_amt_{rid}")
 
             cols3 = st.columns([3, 3])
             with cols3[0]:
@@ -664,18 +623,16 @@ with tab_entry:
 
         proj_confirm = st.checkbox(
             "I confirm the uploaded sanction letters and completion certificates correspond to the projects listed above.",
-            value=False,
-            key="proj_confirm"
+            value=False, key="proj_confirm"
         )
-    else:
-        proj_confirm = True
 
     st.divider()
 
-    # 9. Consultancy Work (Yes/No)
+    # 9 Consultancy
     st.subheader("9. Consultancy Work")
     has_consultancy = st.radio("Consultancy work (Yes/No) *", ["No", "Yes"], horizontal=True, key="has_consultancy")
 
+    consult_confirm = True
     if has_consultancy == "Yes":
         for cw in st.session_state["consultancy"]:
             rid = cw["_id"]
@@ -683,7 +640,8 @@ with tab_entry:
             cw["project_date"] = cols1[0].date_input("Consultancy date *", value=cw["project_date"], key=f"cw_date_{rid}")
             cw["pi_name"] = cols1[1].text_input("PI Name *", value=cw["pi_name"], key=f"cw_pi_{rid}")
             cw["co_pi"] = cols1[2].text_input("Co-PI (if any)", value=cw["co_pi"], key=f"cw_copi_{rid}")
-            cw["dept_sanctioned"] = cols1[3].text_input("Name of Dept., where project is sanctioned *", value=cw["dept_sanctioned"], key=f"cw_dept_{rid}")
+            cw["dept_sanctioned"] = cols1[3].text_input("Name of Dept., where project is sanctioned *",
+                                                        value=cw["dept_sanctioned"], key=f"cw_dept_{rid}")
             cw["status"] = cols1[4].selectbox("Status *", ["Ongoing", "Completed"], key=f"cw_status_{rid}")
 
             if cols1[5].button("➖", key=f"cw_rm_{rid}"):
@@ -696,7 +654,8 @@ with tab_entry:
             cw["project_title"] = cols2[0].text_input("Project title *", value=cw["project_title"], key=f"cw_title_{rid}")
             cw["funding_agency"] = cols2[1].text_input("Funding agency / Client *", value=cw["funding_agency"], key=f"cw_ag_{rid}")
             cw["duration"] = cols2[2].text_input("Duration *", value=cw["duration"], key=f"cw_dur_{rid}")
-            cw["amount_lakhs"] = cols2[3].number_input("Amount (Lakhs) *", min_value=0.0, step=0.5, value=float(cw["amount_lakhs"]), key=f"cw_amt_{rid}")
+            cw["amount_lakhs"] = cols2[3].number_input("Amount (Lakhs) *", min_value=0.0, step=0.5,
+                                                       value=float(cw["amount_lakhs"]), key=f"cw_amt_{rid}")
 
             cols3 = st.columns([3, 3])
             with cols3[0]:
@@ -712,111 +671,102 @@ with tab_entry:
 
         consult_confirm = st.checkbox(
             "I confirm the uploaded documents (if any) correspond to the consultancy items listed above.",
-            value=False,
-            key="consult_confirm"
+            value=False, key="consult_confirm"
         )
-    else:
-        consult_confirm = True
 
+    # Submit
     submitted = st.button("✅ Submit", key="submit_btn")
 
-    # ----------------------------
-    # Validate + Save
-    # ----------------------------
     if submitted:
         errors = []
 
         if not name.strip():
             errors.append("Name of the Faculty is required.")
-
         if has_academic == "Yes" and not pub_confirm:
             errors.append("Please confirm Journal/Conference publication PDFs matching.")
-
         if has_sponsored == "Yes" and not proj_confirm:
             errors.append("Please confirm Sponsored project documents matching.")
-
         if has_consultancy == "Yes" and not consult_confirm:
             errors.append("Please confirm Consultancy documents matching.")
 
+        # Validate membership
         if has_membership == "Yes":
             for idx, m in enumerate(st.session_state["memberships"], start=1):
                 if not all([m["body_name"].strip(), m["membership_number"].strip(), m["level"].strip(), m["grade_position"].strip()]):
                     errors.append(f"Membership #{idx}: all fields are required.")
 
+        # Validate FDP
         if has_fdp == "Yes":
             for idx, f in enumerate(st.session_state["fdps"], start=1):
-                if not all([
-                    (f.get("program_type") or "").strip(),
-                    (f.get("program_name") or "").strip(),
-                    (f.get("involvement") or "").strip(),
-                    (f.get("date") or "").strip(),
-                    (f.get("location") or "").strip(),
-                    (f.get("organised_by") or "").strip()
-                ]):
+                if not all([(f.get("program_type") or "").strip(), (f.get("program_name") or "").strip(),
+                            (f.get("involvement") or "").strip(), (f.get("date") or "").strip(),
+                            (f.get("location") or "").strip(), (f.get("organised_by") or "").strip()]):
                     errors.append(f"Resource person entry #{idx}: all fields are required.")
 
+        # Validate courses
         if has_courses == "Yes":
             for idx, c in enumerate(st.session_state["courses"], start=1):
                 if not all([c["date"].strip(), c["course_name"].strip(), c["offered_by"].strip(), c["grade"].strip()]):
                     errors.append(f"Course #{idx}: all fields are required.")
 
+        # Validate support
         if has_support == "Yes":
             for idx, s in enumerate(st.session_state["student_support"], start=1):
                 if not all([s["project_name"].strip(), s["event_date"].strip(), s["place"].strip()]):
                     errors.append(f"Student support entry #{idx}: project name, date, place are required.")
 
+        # Validate industry
         if has_industry == "Yes":
             for idx, a in enumerate(st.session_state["industry"], start=1):
                 if not all([a["activity_name"].strip(), a["company_place"].strip(), a["duration"].strip(), a["outcomes"].strip()]):
                     errors.append(f"Industry entry #{idx}: all fields are required.")
 
+        # Validate academic pubs
         if has_academic == "Yes":
             for idx, p in enumerate(st.session_state["pubs_jc"], start=1):
                 rid = p["_id"]
                 pdf_dict = st.session_state.get(f"jc_pdf_{rid}__stored")
                 if not p["pub_type"].strip() or not p["title"].strip() or not p["doi"].strip():
-                    errors.append(f"Publication #{idx}: Type, Title, and DOI are required.")
+                    errors.append(f"Publication #{idx}: Type, Title, DOI are required.")
                 if p.get("pub_date") is None:
                     errors.append(f"Publication #{idx}: Publication date is required.")
                 if not pdf_dict:
                     errors.append(f"Publication #{idx}: PDF upload is required.")
 
+        # Validate books
         if has_books == "Yes":
             for idx, b in enumerate(st.session_state["books"], start=1):
                 if not b["item_type"].strip() or not b["title"].strip():
                     errors.append(f"Book/Chapter #{idx}: Type and Title are required.")
 
+        # Validate patents
         if has_patents == "Yes":
             for idx, pm in enumerate(st.session_state["patents_models"], start=1):
                 if not (pm.get("item_type") or "").strip() or not (pm.get("title") or "").strip() or pm.get("item_date") is None:
-                    errors.append(f"Patents/Models/Prototypes item #{idx}: Type, Title/Name, and Date are required.")
+                    errors.append(f"Patents/Models/Prototypes item #{idx}: Type, Title/Name, Date are required.")
 
+        # Validate sponsored
         if has_sponsored == "Yes":
             for idx, sp in enumerate(st.session_state["sponsored"], start=1):
                 rid = sp["_id"]
                 sanction_pdf = st.session_state.get(f"sp_san_{rid}__stored")
                 req_fields = [
-                    (sp.get("pi_name") or ""),
-                    (sp.get("dept_sanctioned") or ""),
-                    (sp.get("project_title") or ""),
-                    (sp.get("funding_agency") or ""),
-                    (sp.get("duration") or ""),
-                    (sp.get("status") or "")
+                    sp.get("pi_name", ""), sp.get("dept_sanctioned", ""),
+                    sp.get("project_title", ""), sp.get("funding_agency", ""),
+                    sp.get("duration", ""), sp.get("status", ""),
                 ]
                 if not all([str(x).strip() for x in req_fields]) or sp.get("project_date") is None:
                     errors.append(f"Sponsored project #{idx}: Date + required fields are mandatory.")
                 if not sanction_pdf:
                     errors.append(f"Sponsored project #{idx}: Sanction/Approval PDF is required.")
 
+        # Validate consultancy
         if has_consultancy == "Yes":
             for idx, cw in enumerate(st.session_state["consultancy"], start=1):
                 req_fields = [
-                    (cw.get("pi_name") or ""),
-                    (cw.get("dept_sanctioned") or ""),
-                    (cw.get("project_title") or ""),
-                    (cw.get("funding_agency") or ""),
-                    (cw.get("duration") or ""),
-                    (cw.get("status") or "")
+                    cw.get("pi_name", ""), cw.get("dept_sanctioned", ""),
+                    cw.get("project_title", ""), cw.get("funding_agency", ""),
+                    cw.get("duration", ""), cw.get("status", ""),
                 ]
                 if not all([str(x).strip() for x in req_fields]) or cw.get("project_date") is None:
                     errors.append(f"Consultancy work #{idx}: Date + required fields are mandatory.")
@@ -824,171 +774,290 @@ with tab_entry:
         if errors:
             st.error("Please fix the following issues:\n\n- " + "\n- ".join(errors))
         else:
-            faculty_id = uuid.uuid4().hex[:10].upper()
-            created_at = datetime.now().isoformat(timespec="seconds")
+            # Save to Google Sheets + Drive
+            try:
+                sh, drive_service = get_google_clients()
 
-            conn = get_conn()
-            cur = conn.cursor()
+                # Ensure worksheets exist
+                ws_map = {}
+                for title, headers in SHEETS.items():
+                    ws_map[title] = ensure_worksheet(sh, title, headers)
 
-            cur.execute(
-                "INSERT INTO faculty (faculty_id, name, designation, created_at) VALUES (?, ?, ?, ?)",
-                (faculty_id, name.strip(), designation, created_at)
-            )
+                submission_id = uuid.uuid4().hex[:12].upper()
+                submitted_at = datetime.now().isoformat(timespec="seconds")
 
-            if has_membership == "Yes":
-                for m in st.session_state["memberships"]:
-                    cur.execute("""
-                        INSERT INTO membership (faculty_id, body_name, membership_number, level, grade_position)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (faculty_id, m["body_name"].strip(), m["membership_number"].strip(), m["level"], m["grade_position"].strip()))
+                # --- faculty sheet
+                ws_map["faculty"].append_row([
+                    submission_id, submitted_at,
+                    name.strip(), designation,
+                    has_membership, has_fdp, has_courses, has_support, has_industry,
+                    has_academic, has_books, has_patents,
+                    has_sponsored, has_consultancy,
+                ])
 
-            if has_fdp == "Yes":
-                for f in st.session_state["fdps"]:
-                    cur.execute("""
-                        INSERT INTO fdp_sttp (faculty_id, program_type, program_name, involvement, date, location, organised_by)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        faculty_id,
-                        (f.get("program_type") or "").strip(),
-                        (f.get("program_name") or "").strip(),
-                        (f.get("involvement") or "").strip(),
-                        (f.get("date") or "").strip(),
-                        (f.get("location") or "").strip(),
-                        (f.get("organised_by") or "").strip()
-                    ))
+                # --- membership
+                if has_membership == "Yes":
+                    rows = []
+                    for m in st.session_state["memberships"]:
+                        rows.append([submission_id, m["body_name"].strip(), m["membership_number"].strip(), m["level"], m["grade_position"].strip()])
+                    if rows:
+                        ws_map["membership"].append_rows(rows, value_input_option="RAW")
 
-            if has_courses == "Yes":
-                for c in st.session_state["courses"]:
-                    cur.execute("""
-                        INSERT INTO courses (faculty_id, date, course_name, offered_by, grade)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (faculty_id, c["date"].strip(), c["course_name"].strip(), c["offered_by"].strip(), c["grade"].strip()))
+                # --- fdp/sttp
+                if has_fdp == "Yes":
+                    rows = []
+                    for f in st.session_state["fdps"]:
+                        rows.append([
+                            submission_id,
+                            (f.get("program_type") or "").strip(),
+                            (f.get("program_name") or "").strip(),
+                            (f.get("involvement") or "").strip(),
+                            (f.get("date") or "").strip(),
+                            (f.get("location") or "").strip(),
+                            (f.get("organised_by") or "").strip(),
+                        ])
+                    if rows:
+                        ws_map["fdp_sttp"].append_rows(rows, value_input_option="RAW")
 
-            if has_support == "Yes":
-                for s in st.session_state["student_support"]:
-                    cur.execute("""
-                        INSERT INTO student_projects_support (faculty_id, project_name, event_date, place, website_link)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (faculty_id, s["project_name"].strip(), s["event_date"].strip(), s["place"].strip(), (s.get("website_link") or "").strip()))
+                # --- courses
+                if has_courses == "Yes":
+                    rows = []
+                    for c in st.session_state["courses"]:
+                        rows.append([submission_id, c["date"].strip(), c["course_name"].strip(), c["offered_by"].strip(), c["grade"].strip()])
+                    if rows:
+                        ws_map["courses"].append_rows(rows, value_input_option="RAW")
 
-            if has_industry == "Yes":
-                for a in st.session_state["industry"]:
-                    cur.execute("""
-                        INSERT INTO industry_collab (faculty_id, activity_name, company_place, duration, outcomes)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (faculty_id, a["activity_name"].strip(), a["company_place"].strip(), a["duration"].strip(), a["outcomes"].strip()))
+                # --- student support
+                if has_support == "Yes":
+                    rows = []
+                    for s in st.session_state["student_support"]:
+                        rows.append([submission_id, s["project_name"].strip(), s["event_date"].strip(), s["place"].strip(), (s.get("website_link") or "").strip()])
+                    if rows:
+                        ws_map["student_support"].append_rows(rows, value_input_option="RAW")
 
-            if has_academic == "Yes":
-                for p in st.session_state["pubs_jc"]:
-                    rid = p["_id"]
-                    pdf_dict = st.session_state.get(f"jc_pdf_{rid}__stored")
-                    pdf_path = save_uploaded_bytes(pdf_dict, f"publications_jc/{faculty_id}")
-                    cur.execute("""
-                        INSERT INTO publications_jc (faculty_id, pub_type, title, doi, pub_date, pdf_path)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (faculty_id, p["pub_type"], p["title"].strip(), p["doi"].strip(), p["pub_date"].isoformat(), pdf_path))
+                # --- industry
+                if has_industry == "Yes":
+                    rows = []
+                    for a in st.session_state["industry"]:
+                        rows.append([submission_id, a["activity_name"].strip(), a["company_place"].strip(), a["duration"].strip(), a["outcomes"].strip()])
+                    if rows:
+                        ws_map["industry"].append_rows(rows, value_input_option="RAW")
 
-            if has_books == "Yes":
-                for b in st.session_state["books"]:
-                    rid = b["_id"]
-                    pdf_dict = st.session_state.get(f"bk_pdf_{rid}__stored")
-                    pdf_path = save_uploaded_bytes(pdf_dict, f"books_chapters/{faculty_id}") if pdf_dict else None
-                    cur.execute("""
-                        INSERT INTO books_chapters (faculty_id, item_type, title, publisher, pub_date, pdf_path)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (faculty_id, b["item_type"], b["title"].strip(), (b.get("publisher") or "").strip(),
-                          b["pub_date"].isoformat() if b.get("pub_date") else "", pdf_path))
+                # --- publications J/C (+ pdf to drive)
+                if has_academic == "Yes":
+                    rows = []
+                    for p in st.session_state["pubs_jc"]:
+                        rid = p["_id"]
+                        pdf_dict = st.session_state.get(f"jc_pdf_{rid}__stored")
+                        up = upload_pdf_to_drive(
+                            drive_service,
+                            pdf_dict,
+                            DRIVE_FOLDER_ID,
+                            name_prefix=f"{submission_id}_PUB",
+                            share_to_email=ADMIN_EMAIL,
+                        )
+                        rows.append([
+                            submission_id,
+                            p["pub_type"],
+                            p["title"].strip(),
+                            p["doi"].strip(),
+                            p["pub_date"].isoformat(),
+                            up["name"], up["file_id"], up["web_view_link"]
+                        ])
+                    if rows:
+                        ws_map["publications_jc"].append_rows(rows, value_input_option="RAW")
 
-            if has_patents == "Yes":
-                for pm in st.session_state["patents_models"]:
-                    rid = pm["_id"]
-                    pdf_dict = st.session_state.get(f"pm_pdf_{rid}__stored")
-                    pdf_path = save_uploaded_bytes(pdf_dict, f"patents_models/{faculty_id}") if pdf_dict else None
-                    cur.execute("""
-                        INSERT INTO patents_models (faculty_id, item_type, title, item_date, details, pdf_path)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (faculty_id, (pm.get("item_type") or "").strip(), (pm.get("title") or "").strip(),
-                          pm["item_date"].isoformat(), (pm.get("details") or "").strip(), pdf_path))
+                # --- books (+ optional pdf)
+                if has_books == "Yes":
+                    rows = []
+                    for b in st.session_state["books"]:
+                        rid = b["_id"]
+                        pdf_dict = st.session_state.get(f"bk_pdf_{rid}__stored")
+                        up = {"name": "", "file_id": "", "web_view_link": ""}
+                        if pdf_dict:
+                            up = upload_pdf_to_drive(
+                                drive_service,
+                                pdf_dict,
+                                DRIVE_FOLDER_ID,
+                                name_prefix=f"{submission_id}_BOOK",
+                                share_to_email=ADMIN_EMAIL,
+                            )
+                        rows.append([
+                            submission_id,
+                            b["item_type"],
+                            b["title"].strip(),
+                            (b.get("publisher") or "").strip(),
+                            b["pub_date"].isoformat() if b.get("pub_date") else "",
+                            up["name"], up["file_id"], up["web_view_link"]
+                        ])
+                    if rows:
+                        ws_map["books_chapters"].append_rows(rows, value_input_option="RAW")
 
-            if has_sponsored == "Yes":
-                for sp in st.session_state["sponsored"]:
-                    rid = sp["_id"]
-                    sanction_dict = st.session_state.get(f"sp_san_{rid}__stored")
-                    completion_dict = st.session_state.get(f"sp_comp_{rid}__stored")
+                # --- patents/models (+ optional pdf)
+                if has_patents == "Yes":
+                    rows = []
+                    for pm in st.session_state["patents_models"]:
+                        rid = pm["_id"]
+                        pdf_dict = st.session_state.get(f"pm_pdf_{rid}__stored")
+                        up = {"name": "", "file_id": "", "web_view_link": ""}
+                        if pdf_dict:
+                            up = upload_pdf_to_drive(
+                                drive_service,
+                                pdf_dict,
+                                DRIVE_FOLDER_ID,
+                                name_prefix=f"{submission_id}_PM",
+                                share_to_email=ADMIN_EMAIL,
+                            )
+                        rows.append([
+                            submission_id,
+                            (pm.get("item_type") or "").strip(),
+                            (pm.get("title") or "").strip(),
+                            pm["item_date"].isoformat(),
+                            (pm.get("details") or "").strip(),
+                            up["name"], up["file_id"], up["web_view_link"]
+                        ])
+                    if rows:
+                        ws_map["patents_models"].append_rows(rows, value_input_option="RAW")
 
-                    sanction_path = save_uploaded_bytes(sanction_dict, f"sponsored/{faculty_id}/sanction")
-                    completion_path = save_uploaded_bytes(completion_dict, f"sponsored/{faculty_id}/completion") if completion_dict else None
+                # --- sponsored (+ sanction required)
+                if has_sponsored == "Yes":
+                    rows = []
+                    for sp in st.session_state["sponsored"]:
+                        rid = sp["_id"]
+                        sanction_dict = st.session_state.get(f"sp_san_{rid}__stored")
+                        completion_dict = st.session_state.get(f"sp_comp_{rid}__stored")
 
-                    cur.execute("""
-                        INSERT INTO sponsored_projects (
-                            faculty_id, project_date, pi_name, co_pi, dept_sanctioned, project_title,
-                            funding_agency, duration, amount_lakhs, status,
-                            sanction_pdf_path, completion_pdf_path
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (faculty_id, sp["project_date"].isoformat(), (sp.get("pi_name") or "").strip(),
-                          (sp.get("co_pi") or "").strip(), (sp.get("dept_sanctioned") or "").strip(),
-                          (sp.get("project_title") or "").strip(), (sp.get("funding_agency") or "").strip(),
-                          (sp.get("duration") or "").strip(), float(sp.get("amount_lakhs") or 0.0),
-                          (sp.get("status") or "").strip(), sanction_path, completion_path))
+                        up_san = upload_pdf_to_drive(
+                            drive_service,
+                            sanction_dict,
+                            DRIVE_FOLDER_ID,
+                            name_prefix=f"{submission_id}_SP_SAN",
+                            share_to_email=ADMIN_EMAIL,
+                        )
+                        up_comp = {"name": "", "file_id": "", "web_view_link": ""}
+                        if completion_dict:
+                            up_comp = upload_pdf_to_drive(
+                                drive_service,
+                                completion_dict,
+                                DRIVE_FOLDER_ID,
+                                name_prefix=f"{submission_id}_SP_COMP",
+                                share_to_email=ADMIN_EMAIL,
+                            )
 
-            if has_consultancy == "Yes":
-                for cw in st.session_state["consultancy"]:
-                    rid = cw["_id"]
-                    sanction_dict = st.session_state.get(f"cw_san_{rid}__stored")
-                    completion_dict = st.session_state.get(f"cw_comp_{rid}__stored")
+                        rows.append([
+                            submission_id,
+                            sp["project_date"].isoformat(),
+                            (sp.get("pi_name") or "").strip(),
+                            (sp.get("co_pi") or "").strip(),
+                            (sp.get("dept_sanctioned") or "").strip(),
+                            (sp.get("project_title") or "").strip(),
+                            (sp.get("funding_agency") or "").strip(),
+                            (sp.get("duration") or "").strip(),
+                            float(sp.get("amount_lakhs") or 0.0),
+                            (sp.get("status") or "").strip(),
+                            up_san["name"], up_san["file_id"], up_san["web_view_link"],
+                            up_comp["name"], up_comp["file_id"], up_comp["web_view_link"],
+                        ])
+                    if rows:
+                        ws_map["sponsored_projects"].append_rows(rows, value_input_option="RAW")
 
-                    sanction_path = save_uploaded_bytes(sanction_dict, f"consultancy/{faculty_id}/approval") if sanction_dict else None
-                    completion_path = save_uploaded_bytes(completion_dict, f"consultancy/{faculty_id}/completion") if completion_dict else None
+                # --- consultancy (pdf optional)
+                if has_consultancy == "Yes":
+                    rows = []
+                    for cw in st.session_state["consultancy"]:
+                        rid = cw["_id"]
+                        approval_dict = st.session_state.get(f"cw_san_{rid}__stored")
+                        completion_dict = st.session_state.get(f"cw_comp_{rid}__stored")
 
-                    cur.execute("""
-                        INSERT INTO consultancy_work (
-                            faculty_id, project_date, pi_name, co_pi, dept_sanctioned, project_title,
-                            funding_agency, duration, amount_lakhs, status,
-                            sanction_pdf_path, completion_pdf_path
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (faculty_id, cw["project_date"].isoformat(), (cw.get("pi_name") or "").strip(),
-                          (cw.get("co_pi") or "").strip(), (cw.get("dept_sanctioned") or "").strip(),
-                          (cw.get("project_title") or "").strip(), (cw.get("funding_agency") or "").strip(),
-                          (cw.get("duration") or "").strip(), float(cw.get("amount_lakhs") or 0.0),
-                          (cw.get("status") or "").strip(), sanction_path, completion_path))
+                        up_app = {"name": "", "file_id": "", "web_view_link": ""}
+                        if approval_dict:
+                            up_app = upload_pdf_to_drive(
+                                drive_service,
+                                approval_dict,
+                                DRIVE_FOLDER_ID,
+                                name_prefix=f"{submission_id}_CW_APP",
+                                share_to_email=ADMIN_EMAIL,
+                            )
 
-            conn.commit()
-            conn.close()
+                        up_comp = {"name": "", "file_id": "", "web_view_link": ""}
+                        if completion_dict:
+                            up_comp = upload_pdf_to_drive(
+                                drive_service,
+                                completion_dict,
+                                DRIVE_FOLDER_ID,
+                                name_prefix=f"{submission_id}_CW_COMP",
+                                share_to_email=ADMIN_EMAIL,
+                            )
 
-            st.success(f"Submitted successfully ✅  |  Faculty ID: {faculty_id}")
+                        rows.append([
+                            submission_id,
+                            cw["project_date"].isoformat(),
+                            (cw.get("pi_name") or "").strip(),
+                            (cw.get("co_pi") or "").strip(),
+                            (cw.get("dept_sanctioned") or "").strip(),
+                            (cw.get("project_title") or "").strip(),
+                            (cw.get("funding_agency") or "").strip(),
+                            (cw.get("duration") or "").strip(),
+                            float(cw.get("amount_lakhs") or 0.0),
+                            (cw.get("status") or "").strip(),
+                            up_app["name"], up_app["file_id"], up_app["web_view_link"],
+                            up_comp["name"], up_comp["file_id"], up_comp["web_view_link"],
+                        ])
+                    if rows:
+                        ws_map["consultancy_work"].append_rows(rows, value_input_option="RAW")
+
+                st.success(f"Submitted successfully ✅ | Submission ID: {submission_id}")
+                st.info("Your data is saved permanently in Google Sheets and PDFs in Google Drive.")
+
+            except Exception as e:
+                st.error(f"Submission failed due to configuration or API error: {e}")
 
 
 # ============================
-# TAB 2: ADMIN (Download)
+# TAB 2: ADMIN
 # ============================
 with tab_admin:
     st.title("Admin Downloads")
 
-    admin_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
-    if not admin_pw:
-        st.error("Admin access is not configured. Set ADMIN_PASSWORD in Streamlit Secrets.")
+    if not ADMIN_PASSWORD:
+        st.error("Admin password not configured. Add app.admin_password in Streamlit secrets.")
         st.stop()
 
     entered = st.text_input("Enter Admin Password", type="password")
-    if entered != admin_pw:
+    if entered != ADMIN_PASSWORD:
         st.warning("Enter the correct admin password to access downloads.")
         st.stop()
 
-    table_names = [
-        "faculty",
-        "membership",
-        "fdp_sttp",
-        "courses",
-        "student_projects_support",
-        "industry_collab",
-        "publications_jc",
-        "books_chapters",
-        "patents_models",
-        "sponsored_projects",
-        "consultancy_work",
-    ]
+    try:
+        sh, _drive = get_google_clients()
+    except Exception as e:
+        st.error(f"Google configuration error: {e}")
+        st.stop()
 
-    dfs = {t: fetch_table_df(t) for t in table_names}
+    # Load dataframes
+    dfs = {}
+    for title in SHEETS.keys():
+        try:
+            ws = sh.worksheet(title)
+            values = ws.get_all_values()
+            if not values:
+                dfs[title] = pd.DataFrame(columns=SHEETS[title])
+                continue
+            headers = values[0]
+            rows = values[1:]
+            dfs[title] = pd.DataFrame(rows, columns=headers)
+        except Exception:
+            dfs[title] = pd.DataFrame(columns=SHEETS[title])
+
+    st.subheader("Quick Summary")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Faculty submissions", len(dfs["faculty"]))
+    c2.metric("Publications (J/C)", len(dfs["publications_jc"]))
+    c3.metric("Patents/Models", len(dfs["patents_models"]))
+    c4.metric("Sponsored projects", len(dfs["sponsored_projects"]))
+    c5.metric("Consultancy", len(dfs["consultancy_work"]))
+
+    st.divider()
 
     st.subheader("Download All Data")
     try:
@@ -998,21 +1067,25 @@ with tab_admin:
             label="⬇️ Download ALL DATA (Excel, multi-sheet)",
             data=excel_bytes,
             file_name="faculty_submissions_all.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except ModuleNotFoundError:
-        st.info("Excel export needs 'openpyxl'. Install it using: python -m pip install openpyxl (CSV still works)")
+        st.info("Excel export needs 'openpyxl'. Install it or use CSV downloads below.")
+
+    st.divider()
 
     st.subheader("Download Individual Tables (CSV)")
-    for t in table_names:
+    for title, df in dfs.items():
         st.download_button(
-            label=f"⬇️ Download {t}.csv",
-            data=dfs[t].to_csv(index=False).encode("utf-8"),
-            file_name=f"{t}.csv",
+            label=f"⬇️ Download {title}.csv",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{title}.csv",
             mime="text/csv",
-            key=f"dl_{t}"
+            key=f"dl_{title}",
         )
 
+    st.divider()
+
     st.subheader("Preview Data")
-    table_to_preview = st.selectbox("Select table to preview", table_names)
+    table_to_preview = st.selectbox("Select table to preview", list(SHEETS.keys()))
     st.dataframe(dfs[table_to_preview], use_container_width=True)
