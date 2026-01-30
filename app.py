@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime, date
 from io import BytesIO
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -88,11 +89,9 @@ def upload_to_supabase_storage(file_dict: Dict[str, Any], path: str) -> str:
     if not file_dict:
         raise ValueError("No file provided for upload.")
     data = file_dict["bytes"]
-    name = file_dict["name"]
     if len(data) == 0:
         raise ValueError("Empty file uploaded.")
 
-    # Upload (upsert to avoid collisions if rerun)
     sb.storage.from_(BUCKET).upload(
         path=path,
         file=data,
@@ -107,6 +106,14 @@ def signed_url(path: str, expires_in: int = 3600) -> str:
     """
     res = sb.storage.from_(BUCKET).create_signed_url(path, expires_in)
     return res.get("signedURL", "")
+
+
+def storage_download_bytes(path: str) -> bytes:
+    """
+    Download a file from Supabase Storage as bytes using service role.
+    """
+    # supabase-py returns bytes
+    return sb.storage.from_(BUCKET).download(path)
 
 
 # ----------------------------
@@ -180,6 +187,79 @@ def consultancy_factory():
         "amount_lakhs": 0.0,
         "status": "Ongoing",
     }
+
+
+# ----------------------------
+# Excel + ZIP helpers (Admin)
+# ----------------------------
+def make_excel_bytes(dfs: Dict[str, pd.DataFrame]) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for sheet_name, df in dfs.items():
+            safe_sheet = sheet_name[:31]  # Excel limit
+            (df if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=safe_sheet, index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def gather_storage_paths(dfs: Dict[str, pd.DataFrame]) -> List[str]:
+    """
+    Collect all storage paths from tables that may contain PDF paths.
+    Returns unique paths.
+    """
+    paths: List[str] = []
+
+    def add_col(table: str, col: str):
+        if table in dfs and col in dfs[table].columns:
+            for v in dfs[table][col].dropna().astype(str).tolist():
+                v = v.strip()
+                if v and v.lower() != "none":
+                    paths.append(v)
+
+    # publications
+    add_col("publications_jc", "pdf_path")
+
+    # optional PDFs
+    add_col("books_chapters", "pdf_path")
+    add_col("patents_models", "pdf_path")
+
+    # sponsored
+    add_col("sponsored_projects", "sanction_path")
+    add_col("sponsored_projects", "completion_path")
+
+    # consultancy
+    add_col("consultancy_work", "approval_path")
+    add_col("consultancy_work", "completion_path")
+
+    # unique, stable order
+    seen = set()
+    uniq = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def make_zip_of_pdfs(storage_paths: List[str]) -> Tuple[bytes, List[str]]:
+    """
+    Download each storage path from Supabase and zip them.
+    Returns (zip_bytes, failed_paths).
+    """
+    zip_buffer = BytesIO()
+    failed: List[str] = []
+
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in storage_paths:
+            try:
+                data = storage_download_bytes(path)
+                # Write with same path structure in zip:
+                zf.writestr(path, data)
+            except Exception:
+                failed.append(path)
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue(), failed
 
 
 # ----------------------------
@@ -842,6 +922,23 @@ with tab_admin:
 
     st.divider()
 
+    # ----------------------------
+    # NEW: One Excel (multi-sheet)
+    # ----------------------------
+    st.subheader("Download everything as ONE Excel (multi-sheet)")
+    excel_bytes = make_excel_bytes(dfs)
+    st.download_button(
+        "⬇️ Download ALL tables (Excel)",
+        data=excel_bytes,
+        file_name="faculty_submissions_all_tables.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.divider()
+
+    # ----------------------------
+    # Existing: CSV per table
+    # ----------------------------
     st.subheader("Download CSV (per table)")
     for t, df in dfs.items():
         st.download_button(
@@ -854,6 +951,39 @@ with tab_admin:
 
     st.divider()
 
+    # ----------------------------
+    # NEW: ZIP all PDFs
+    # ----------------------------
+    st.subheader("Download ALL PDFs as one ZIP")
+    st.caption("This downloads every stored PDF from Supabase Storage into a single ZIP. "
+               "If you have many PDFs, this may take a minute.")
+
+    storage_paths = gather_storage_paths(dfs)
+    st.write(f"Found **{len(storage_paths)}** file(s) referenced in database.")
+
+    if st.button("📦 Build ZIP of all PDFs"):
+        if not storage_paths:
+            st.warning("No PDF paths found.")
+        else:
+            with st.spinner("Downloading PDFs and building ZIP..."):
+                zip_bytes, failed = make_zip_of_pdfs(storage_paths)
+
+            st.download_button(
+                "⬇️ Download PDFs ZIP",
+                data=zip_bytes,
+                file_name="faculty_uploads_all_pdfs.zip",
+                mime="application/zip",
+            )
+
+            if failed:
+                st.warning(f"{len(failed)} file(s) could not be downloaded. Showing first 20:")
+                st.write(failed[:20])
+
+    st.divider()
+
+    # ----------------------------
+    # Signed URL helper
+    # ----------------------------
     st.subheader("Generate signed link for a stored PDF (private bucket)")
     st.caption("Paste the file path stored in pdf_path / sanction_path / etc. Link valid for 1 hour.")
     path = st.text_input("Storage file path (e.g. SUBID/publications/...)")
