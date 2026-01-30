@@ -1,8 +1,13 @@
 import os
 import uuid
+import socket
+import ssl
+import httplib2
 from datetime import datetime, date
 from io import BytesIO
 from typing import Dict, List, Any, Optional
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
 
 import pandas as pd
 import streamlit as st
@@ -94,52 +99,92 @@ def upload_pdf_to_drive(
     folder_id: str,
     name_prefix: str,
     share_to_email: str = "",
+    max_mb: int = 25,           # you can change this
+    retries: int = 5
 ) -> Dict[str, str]:
     """
-    Uploads bytes to Google Drive folder and returns {"file_id":..., "web_view_link":..., "name":...}
-    - By default files remain private to service account.
-    - If share_to_email provided, grant reader permission to that email.
+    Resumable upload with retry. Returns {"file_id","web_view_link","name"}.
     """
+    if not file_dict:
+        raise ValueError("No file provided for upload.")
+
     filename = file_dict.get("name", "file.pdf")
     data = file_dict.get("bytes", b"")
+    size_mb = len(data) / (1024 * 1024)
+
+    # Optional size guard to avoid long uploads/timeouts
+    if size_mb > max_mb:
+        raise ValueError(f"PDF too large ({size_mb:.1f} MB). Please upload ≤ {max_mb} MB.")
+
     safe_name = f"{name_prefix}_{filename}"
 
-    media = MediaInMemoryUpload(data, mimetype="application/pdf", resumable=False)
+    # Use BytesIO for MediaIoBaseUpload (supports resumable)
+    bio = BytesIO(data)
+    media = MediaIoBaseUpload(bio, mimetype="application/pdf", resumable=True)
 
-    metadata = {
-        "name": safe_name,
-        "parents": [folder_id],
-    }
+    metadata = {"name": safe_name, "parents": [folder_id]}
 
-    created = drive_service.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id, webViewLink, name",
-    ).execute()
-
-    file_id = created["id"]
-
-    # Optional: share to admin email so you can open links easily
-    if share_to_email:
+    # Retry loop (handles transient disconnects)
+    last_err = None
+    for attempt in range(1, retries + 1):
         try:
-            drive_service.permissions().create(
-                fileId=file_id,
-                body={
-                    "type": "user",
-                    "role": "reader",
-                    "emailAddress": share_to_email,
-                },
-                sendNotificationEmail=False,
-            ).execute()
-        except Exception:
-            # Don't break submission if sharing fails
-            pass
+            request = drive_service.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id, webViewLink, name",
+                supportsAllDrives=True,
+            )
 
-    return {
-        "file_id": file_id,
-        "web_view_link": created.get("webViewLink", ""),
-        "name": created.get("name", safe_name),
-    }
+            response = None
+            while response is None:
+                status, response = request.next_chunk(num_retries=3)  # built-in chunk retries
+
+            file_id = response["id"]
+
+            # Optional sharing
+            if share_to_email:
+                try:
+                    drive_service.permissions().create(
+                        fileId=file_id,
+                        body={"type": "user", "role": "reader", "emailAddress": share_to_email},
+                        sendNotificationEmail=False,
+                        supportsAllDrives=True,
+                    ).execute()
+                except Exception:
+                    pass
+
+            return {
+                "file_id": file_id,
+                "web_view_link": response.get("webViewLink", ""),
+                "name": response.get("name", safe_name),
+            }
+
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError, socket.timeout, httplib2.HttpLib2Error) as e:
+            last_err = e
+            # exponential backoff
+            time.sleep(min(8, 2 ** attempt))
+            # reset stream pointer for retry
+            bio.seek(0)
+            media = MediaIoBaseUpload(bio, mimetype="application/pdf", resumable=True)
+            continue
+
+        except HttpError as e:
+            # Some HttpErrors are retryable (5xx)
+            last_err = e
+            status = getattr(e, "status_code", None)
+            if status is None:
+                try:
+                    status = e.resp.status
+                except Exception:
+                    status = None
+            if status and int(status) >= 500 and attempt < retries:
+                time.sleep(min(8, 2 ** attempt))
+                bio.seek(0)
+                media = MediaIoBaseUpload(bio, mimetype="application/pdf", resumable=True)
+                continue
+            raise
+
+    raise RuntimeError(f"Drive upload failed after {retries} retries: {repr(last_err)}")
 
 
 # ----------------------------
@@ -1091,5 +1136,6 @@ with tab_admin:
     st.subheader("Preview Data")
     table_to_preview = st.selectbox("Select table to preview", list(SHEETS.keys()))
     st.dataframe(dfs[table_to_preview], use_container_width=True)
+
 
 
