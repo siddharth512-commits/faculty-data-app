@@ -1010,10 +1010,10 @@ with tab_entry:
                 st.info("Your data is saved permanently in Google Sheets and PDFs in Google Drive.")
 
             except Exception as e:
-    st.error("Submission failed. Full error details below:")
-    st.write("Error type:", type(e).__name__)
-    st.write("Error repr:", repr(e))
-    st.exception(e)   # shows full traceback in the app
+                st.error("Submission failed. Full error details below:")
+                st.write("Error type:", type(e).__name__)
+                st.write("Error repr:", repr(e))
+                st.exception(e)   # shows full traceback in the app
 
 # ============================
 # TAB 2: ADMIN
@@ -1091,4 +1091,5 @@ with tab_admin:
     st.subheader("Preview Data")
     table_to_preview = st.selectbox("Select table to preview", list(SHEETS.keys()))
     st.dataframe(dfs[table_to_preview], use_container_width=True)
+
 
